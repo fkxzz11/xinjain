@@ -14,10 +14,7 @@ jobs:
 
       - name: Apply repo-root overrides
         run: |
-          shopt -s nullglob
-          for f in *.m *.h Makefile Makefile.plus *.plist; do
-            cp -f "$f" build/
-          done
+          cp -f *.m *.h Makefile Makefile.plus *.plist build/ 2>/dev/null || true
           ls build
 
       - name: Pick filter plist
