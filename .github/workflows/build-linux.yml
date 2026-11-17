@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Unpack project zip
-        run: unzip -o FakeGPS-build.zip -d build
+        run: python3 -m zipfile -e FakeGPS-build.zip build
 
       - name: Pick filter plist
         working-directory: build
