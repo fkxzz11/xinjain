@@ -20,7 +20,11 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#import <substrate.h>   // MSHookMessageEx
+// 不链接 libsubstrate。
+// 原插件链的是 /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate（系统绝对路径），
+// 在非越狱/注入式安装的 App 里不存在，dyld 会在启动瞬间报 Library not loaded 直接闪退。
+// 本项目只需要“替换 ObjC 方法实现”，用 runtime 等价实现即可。
+void MSHookMessageEx(Class cls, SEL sel, IMP replacement, IMP *result);
 
 #import "MapViewController.h"
 
@@ -334,6 +338,30 @@ static void UIViewController_handleDoubleTaps(id self, SEL _cmd, UITapGestureRec
     dispatch_async(dispatch_get_main_queue(), ^{
         [self presentViewController:navigationController animated:YES completion:nil];
     });
+}
+
+#pragma mark - MSHookMessageEx 等价实现（无 substrate 依赖）
+
+void MSHookMessageEx(Class cls, SEL sel, IMP replacement, IMP *result)
+{
+    if (result != NULL) {
+        *result = NULL;
+    }
+    if (cls == Nil || sel == NULL || replacement == NULL) {
+        return;
+    }
+
+    Method method = class_getInstanceMethod(cls, sel);
+    if (method != NULL) {
+        IMP original = method_setImplementation(method, replacement);
+        if (result != NULL) {
+            *result = original;
+        }
+        return;
+    }
+
+    // 类里没有这个方法：补一个，原实现留空
+    class_addMethod(cls, sel, replacement, "v@:");
 }
 
 #pragma mark - 安装  (@0x73a0)

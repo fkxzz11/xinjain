@@ -27,7 +27,9 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <substrate.h>
+
+// 该符号由 FakeGPSHooks.m 提供（runtime 等价实现，不链接 substrate）
+void MSHookMessageEx(Class cls, SEL sel, IMP replacement, IMP *result);
 
 static NSString *const kLatitudeKey             = @"latitude";
 static NSString *const kLongitudeKey            = @"longitude";
