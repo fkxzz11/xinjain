@@ -1,0 +1,47 @@
+name: build-linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dylib:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip
+        run: unzip -o FakeGPS-build.zip -d build
+
+      - name: Pick filter plist
+        working-directory: build
+        run: |
+          if grep -q 'com.example.targetapp' FakeGPS.plist; then
+            cp FakeGPS-anyapp.plist FakeGPS.plist
+          fi
+
+      - name: Install Theos
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fakeroot xz-utils make git libssl-dev curl
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build tweak
+        working-directory: build
+        run: make package FINALPACKAGE=1
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p out
+          cp build/packages/*.deb out/ 2>/dev/null || true
+          find build/.theos -name '*.dylib' -exec cp {} out/ \; 2>/dev/null || true
+          cp build/FakeGPS.plist out/ 2>/dev/null || true
+          ls -l out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FakeGPS-linux
+          path: out/*
+          if-no-files-found: warn
