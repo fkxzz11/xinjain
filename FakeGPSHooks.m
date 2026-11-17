@@ -159,6 +159,12 @@ static void hooked_CLLocationManager_setDelegate(CLLocationManager *self, SEL _c
 {
     orig_CLLocationManager_setDelegate(self, _cmd, delegate);
 
+    // delegate 为 nil 时 NSStringFromClass(nil) 返回 nil，
+    // [NSMutableSet addObject:nil] 会抛 NSInvalidArgumentException 直接 abort（已在真机崩溃日志确认）
+    if (delegate == nil) {
+        return;
+    }
+
     if ([NSBundle mainBundle].bundleIdentifier == nil) {
         return;
     }
@@ -167,26 +173,36 @@ static void hooked_CLLocationManager_setDelegate(CLLocationManager *self, SEL _c
         hookedDelegateClasses = [NSMutableSet set];
     });
 
-    Class delegateClass = object_getClass(delegate);
-    NSString *className = NSStringFromClass(delegateClass);
-
-    @synchronized (hookedDelegateClasses) {
-        if ([hookedDelegateClasses containsObject:className]) {
-            return;
-        }
-        [hookedDelegateClasses addObject:className];
-
-        SEL selector = @selector(locationManager:didUpdateLocations:);
-        Method method = class_getInstanceMethod(delegateClass, selector);
-        if (method == NULL) {
+    @try {
+        Class delegateClass = object_getClass(delegate);
+        NSString *className = NSStringFromClass(delegateClass);
+        if (className.length == 0) {
             return;
         }
 
-        IMP originalIMP = method_getImplementation(method);
-        IMP replacement = imp_implementationWithBlock(^void (id blockSelf, CLLocationManager *manager, NSArray *locations) {
-            hooked_didUpdateLocations(blockSelf, selector, manager, locations, originalIMP);
-        });
-        method_setImplementation(method, replacement);
+        @synchronized (hookedDelegateClasses) {
+            if (hookedDelegateClasses == nil) {
+                return;
+            }
+            if ([hookedDelegateClasses containsObject:className]) {
+                return;
+            }
+            [hookedDelegateClasses addObject:className];
+
+            SEL selector = @selector(locationManager:didUpdateLocations:);
+            Method method = class_getInstanceMethod(delegateClass, selector);
+            if (method == NULL) {
+                return;
+            }
+
+            IMP originalIMP = method_getImplementation(method);
+            IMP replacement = imp_implementationWithBlock(^void (id blockSelf, CLLocationManager *manager, NSArray *locations) {
+                hooked_didUpdateLocations(blockSelf, selector, manager, locations, originalIMP);
+            });
+            method_setImplementation(method, replacement);
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[LocationSpoof] Exception in setDelegate hook: %@", exception);
     }
 }
 

@@ -1,13 +1,10 @@
-# FakeGPS — Theos tweak（与原版二进制同规格：minos 16.5 / arm64e）
+# FakeGPS — Theos tweak
 #
-# 对齐原始 FakeGPS.dylib 的构建参数：
-#   原始: platform=iOS minos=16.5.0 sdk=16.4/16.5, 切片 arm64 + arm64e（App 内为 arm64e）
-#   这里只出 arm64e，避免注入工具/进程架构不匹配导致的 "wrong architecture" 秒退
-#
+# 目标设备: iPhone14,6 / iOS 15.6  →  minos 必须 ≤ 15.6（这里用 14.0）
 # 构建: make package FINALPACKAGE=1
 
-export TARGET = iphone:clang:latest:16.5
-export ARCHS  = arm64e
+export TARGET = iphone:clang:latest:14.0
+export ARCHS  = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
