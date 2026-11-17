@@ -1,0 +1,62 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  dylib:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip
+        run: unzip -o FakeGPS-build.zip -d build
+
+      - name: Pick filter plist
+        working-directory: build
+        run: |
+          if grep -q 'com.example.targetapp' FakeGPS.plist; then
+            cp FakeGPS-anyapp.plist FakeGPS.plist
+            echo "placeholder bundle id -> anyapp filter"
+          fi
+
+      - name: Setup Theos
+        run: |
+          brew install ldid xz >/dev/null
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tar.gz
+          tar xzf /tmp/sdks.tar.gz -C /tmp
+          cp -R /tmp/sdks-master/*.sdk "$THEOS/sdks/"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Build full tweak
+        working-directory: build
+        run: make package FINALPACKAGE=1
+
+      - name: Build plus dylib
+        working-directory: build
+        run: make -f Makefile.plus package FINALPACKAGE=1
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p out
+          cp build/packages/*.deb out/ 2>/dev/null || true
+          find build/.theos/obj -name '*.dylib' -exec cp {} out/ \; 2>/dev/null || true
+          cp build/FakeGPS.plist out/ 2>/dev/null || true
+          ls -l out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FakeGPS-${{ matrix.os }}
+          path: out/*
+          if-no-files-found: warn
