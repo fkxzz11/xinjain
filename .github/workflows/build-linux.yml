@@ -12,6 +12,14 @@ jobs:
       - name: Unpack project zip
         run: python3 -m zipfile -e FakeGPS-build.zip build
 
+      - name: Apply repo-root overrides
+        run: |
+          shopt -s nullglob
+          for f in *.m *.h Makefile Makefile.plus *.plist; do
+            cp -f "$f" build/
+          done
+          ls build
+
       - name: Pick filter plist
         working-directory: build
         run: |
