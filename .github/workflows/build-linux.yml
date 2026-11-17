@@ -31,6 +31,13 @@ jobs:
           bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
 
+      - name: Relax warnings
+        working-directory: build
+        run: |
+          sed -i 's/^FakeGPS_CFLAGS.*/FakeGPS_CFLAGS = -fobjc-arc -Wno-everything/' Makefile
+          sed -i 's/^FakeGPSPlus_CFLAGS.*/FakeGPSPlus_CFLAGS = -fobjc-arc -Wno-everything/' Makefile.plus
+          grep -n CFLAGS Makefile Makefile.plus
+
       - name: Build tweak
         working-directory: build
         run: make package FINALPACKAGE=1
