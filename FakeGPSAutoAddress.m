@@ -273,6 +273,9 @@ static BOOL FGTriggerBarButtonItem(UIViewController *viewController, NSArray<NSS
 
 #pragma mark - 控制器
 
+// 前置声明（实现在文件末尾）
+static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double *longitude);
+
 @interface FGAutoAddressController : NSObject
 + (instancetype)sharedController;
 - (void)handleAppearanceOf:(UIViewController *)viewController;
@@ -282,11 +285,16 @@ static BOOL FGTriggerBarButtonItem(UIViewController *viewController, NSArray<NSS
 - (void)copyRowsFromWarehouse:(NSArray<NSDictionary *> *)warehouseRows
                       toStore:(NSArray<NSDictionary *> *)storeRows
                coordinateText:(NSString *)coordinateText;
+- (void)startWebObservation;
+- (void)scanWebViews;
+- (void)readTextFromWKWebView:(UIView *)webView;
+- (void)handlePageText:(NSString *)text source:(NSString *)source;
 @end
 
 @implementation FGAutoAddressController
 {
     NSString *_lastHandledKey;
+    NSString *_lastWebCoordinateKey;
 }
 
 + (instancetype)sharedController
@@ -468,7 +476,136 @@ static BOOL FGTriggerBarButtonItem(UIViewController *viewController, NSArray<NSS
     }
 }
 
+#pragma mark - H5 / WebView 观测
+//
+// 该 App 是 React Native + WebView 混合体：《门店地址》页是 H5 页面
+// （main.jsbundle 中「仓库」「省市区街道」出现 0 次，主程序含 WKWebView/evaluateJavaScript），
+// 文字在 WebView 的 DOM 里，UILabel 扫描抓不到，因此注入 JS 读 innerText。
+
+static NSString *const kFGPageTextJavaScript =
+    @"(function(){try{"
+     "var b=document.body?document.body.innerText:'';"
+     "return b.substring(0,20000);"
+     "}catch(e){return '';}})()";
+
+- (void)startWebObservation
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSTimer *timer = [NSTimer timerWithTimeInterval:3.0
+                                                repeats:YES
+                                                  block:^(NSTimer *t) {
+            [[FGAutoAddressController sharedController] scanWebViews];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAppDidBecomeActive)
+                                                     name:UIApplicationDidBecomeActiveNotification
+                                                   object:nil];
+        NSLog(@"[FakeGPS] WebView 观测已启动");
+    });
+}
+
+- (void)onAppDidBecomeActive
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self scanWebViews];
+    });
+}
+
+- (void)scanWebViews
+{
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        return;
+    }
+    if (![self isEnabled]) {
+        return;
+    }
+
+    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    if (keyWindow == nil) {
+        return;
+    }
+
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:keyWindow];
+    while (stack.count > 0) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+
+        NSString *className = NSStringFromClass(view.class);
+        if ([className isEqualToString:@"WKWebView"]) {
+            [self readTextFromWKWebView:view];
+        } else if ([className isEqualToString:@"UIWebView"]) {
+            NSString *text = ((NSString * (*)(id, SEL, id))objc_msgSend)(view,
+                    @selector(stringByEvaluatingJavaScriptFromString:),
+                    kFGPageTextJavaScript);
+            if (text.length > 0) {
+                [self handlePageText:text source:@"UIWebView"];
+            }
+        }
+
+        if (view.subviews.count > 0) {
+            [stack addObjectsFromArray:view.subviews];
+        }
+    }
+}
+
+- (void)readTextFromWKWebView:(UIView *)webView
+{
+    __weak typeof(self) weakSelf = self;
+    id handler = ^(id result, NSError *error) {
+        if (error != nil || ![result isKindOfClass:[NSString class]]) {
+            return;
+        }
+        [weakSelf handlePageText:(NSString *)result source:@"WKWebView"];
+    };
+
+    ((void (*)(id, SEL, id, id))objc_msgSend)(webView,
+                                              @selector(evaluateJavaScript:completionHandler:),
+                                              kFGPageTextJavaScript,
+                                              handler);
+}
+
+- (void)handlePageText:(NSString *)text source:(NSString *)source
+{
+    if (text.length == 0) {
+        return;
+    }
+
+    double latitude = 0, longitude = 0;
+    if (!FGParseWarehouseCoordinate(text, &latitude, &longitude)) {
+        return;
+    }
+
+    NSString *key = [NSString stringWithFormat:@"%.7f,%.7f", latitude, longitude];
+    if ([key isEqualToString:_lastWebCoordinateKey]) {
+        return;   // 同一坐标不重复处理
+    }
+    _lastWebCoordinateKey = key;
+
+    NSLog(@"[FakeGPS] %@ 捕获仓库坐标 (%f, %f)", source, latitude, longitude);
+    [self overrideDeviceLocationWithLatitude:latitude longitude:longitude];
+}
+
 @end
+
+#pragma mark - 从页面文本里解析「仓库地址」的经纬度
+
+static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double *longitude)
+{
+    NSRange anchor = [text rangeOfString:@"仓库地址"];
+    if (anchor.location == NSNotFound) {
+        return NO;
+    }
+
+    NSUInteger start = anchor.location + anchor.length;
+    NSUInteger tailLength = MIN((NSUInteger)1200, text.length - start);
+    NSString *tail = [text substringWithRange:NSMakeRange(start, tailLength)];
+
+    return FGParseCoordinate(tail, latitude, longitude);
+}
 
 #pragma mark - 安装（挂在 UIViewController viewDidAppear: 上）
 
@@ -485,4 +622,9 @@ void FGAutoAddressInstall(void)
     MSHookMessageEx(objc_getClass("UIViewController"), @selector(viewDidAppear:),
                     (IMP)hooked_UIViewController_viewDidAppear,
                     (IMP *)&orig_UIViewController_viewDidAppear);
+
+    // 《门店地址》页是 WebView 承载的 H5：启动 DOM 轮询
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[FGAutoAddressController sharedController] startWebObservation];
+    });
 }
