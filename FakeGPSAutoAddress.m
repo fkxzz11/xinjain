@@ -55,10 +55,17 @@ static BOOL gFGWebHooked  = NO;
 static void (*orig_loadRequest)(id, SEL, id);
 static void (*orig_evaluateJS)(id, SEL, NSString *, id);
 static void (*orig_addUserScript)(id, SEL, id);
+static void (*orig_addMessageHandler)(id, SEL, id, NSString *);
+static void (*orig_setCustomUserAgent)(id, SEL, NSString *);
+
+static NSMutableDictionary<NSString *, id> *gFGMessageHandlers = nil;
+static NSString *gFGCustomUserAgent = nil;
 
 static void hooked_loadRequest(id self, SEL _cmd, NSURLRequest *request);
 static void hooked_evaluateJS(id self, SEL _cmd, NSString *script, id completion);
 static void hooked_addUserScript(id self, SEL _cmd, id userScript);
+static void hooked_addMessageHandler(id self, SEL _cmd, id handler, NSString *name);
+static void hooked_setCustomUserAgent(id self, SEL _cmd, NSString *userAgent);
 
 #pragma mark - 工具
 
@@ -173,7 +180,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
                                                      name:UIApplicationDidBecomeActiveNotification
                                                    object:nil];
 
-        NSLog(@"[FakeGPS] 观测已启动");
+        NSLog(@"[FakeGPS] observation started");
     });
 }
 
@@ -276,10 +283,15 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             if (now - _lastDiagLogTime > 10.0) {
                 _lastDiagLogTime = now;
-                NSString *head = text.length > 200 ? [text substringToIndex:200] : text;
-                head = [head stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
-                NSLog(@"[FakeGPS] 后台页面未见仓库地址(len=%lu): %@",
-                      (unsigned long)text.length, head);
+                NSString *head = text.length > 160 ? [text substringToIndex:160] : text;
+                NSData *headData = [head dataUsingEncoding:NSUTF8StringEncoding];
+                NSMutableString *hex = [NSMutableString stringWithCapacity:headData.length * 2];
+                const unsigned char *bytes = headData.bytes;
+                for (NSUInteger i = 0; i < headData.length; i++) {
+                    [hex appendFormat:@"%02x", bytes[i]];
+                }
+                NSLog(@"[FakeGPS] bg page has no warehouse anchor, len=%lu, head_hex=%@",
+                      (unsigned long)text.length, hex);
             }
         }
         return;
@@ -292,7 +304,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     _lastCoordinateKey = key;
     _lastCoordinateTime = [NSDate date].timeIntervalSince1970;
 
-    NSLog(@"[FakeGPS] %@ 捕获仓库坐标 (%f, %f)", source, latitude, longitude);
+    NSLog(@"[FakeGPS] coords captured by %@ (%f, %f)", source, latitude, longitude);
     [self overrideDeviceLocationWithLatitude:latitude longitude:longitude];
 }
 
@@ -305,7 +317,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     [defaults synchronize];
 
     [[NSNotificationCenter defaultCenter] postNotificationName:@"LocationSpoofingChanged" object:nil];
-    NSLog(@"[FakeGPS] 设备位置已覆盖为仓库坐标 (%f, %f)", latitude, longitude);
+    NSLog(@"[FakeGPS] device location overridden (%f, %f)", latitude, longitude);
 }
 
 #pragma mark 后台静默加载
@@ -326,7 +338,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSString *urlString = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5URLKey];
     if (!FGIsAddressPageURL(urlString)) {
         urlString = kFGDefaultAddressURL;
-        NSLog(@"[FakeGPS] 使用内置地址页 URL");
+        NSLog(@"[FakeGPS] use builtin address URL");
     }
 
     UIWindow *window = [UIApplication sharedApplication].keyWindow;
@@ -355,7 +367,31 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
             userScriptSource, 0, YES);
         id ucc = ((id (*)(id, SEL))objc_msgSend)(config, @selector(userContentController));
         ((void (*)(id, SEL, id))objc_msgSend)(ucc, @selector(addUserScript:), script);
-        NSLog(@"[FakeGPS] 重放 WKUserScript(%lu 字节)", (unsigned long)userScriptSource.length);
+        NSLog(@"[FakeGPS] replay WKUserScript (%lu bytes)", (unsigned long)userScriptSource.length);
+    }
+
+    // 重放 App 用 evaluateJavaScript 注入的用户信息（改为 documentStart，避免页面先跑起来）
+    NSString *injectJSAtStart = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
+    if (injectJSAtStart.length > 0 && usClass != Nil) {
+        id script = ((id (*)(id, SEL, NSString *, NSInteger, BOOL))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)(usClass, @selector(alloc)),
+            @selector(initWithSource:injectionTime:forMainFrameOnly:),
+            injectJSAtStart, 0, YES);
+        id ucc = ((id (*)(id, SEL))objc_msgSend)(config, @selector(userContentController));
+        ((void (*)(id, SEL, id))objc_msgSend)(ucc, @selector(addUserScript:), script);
+        NSLog(@"[FakeGPS] replay injected JS at documentStart (%lu bytes)",
+              (unsigned long)injectJSAtStart.length);
+    }
+
+    // 重放 App 注册的 JS 桥 handler（H5 靠它向原生要用户信息）
+    if (gFGMessageHandlers.count > 0) {
+        id ucc = ((id (*)(id, SEL))objc_msgSend)(config, @selector(userContentController));
+        NSArray *names = gFGMessageHandlers.allKeys;
+        for (NSString *name in names) {
+            ((void (*)(id, SEL, id, NSString *))objc_msgSend)(
+                ucc, @selector(addScriptMessageHandler:name:), gFGMessageHandlers[name], name);
+        }
+        NSLog(@"[FakeGPS] replay %lu message handlers", (unsigned long)names.count);
     }
 
     id webView = ((id (*)(id, SEL, CGRect, id))objc_msgSend)(
@@ -363,6 +399,11 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
         @selector(initWithFrame:configuration:),
         CGRectMake(0, -10, 1, 1),
         config);
+
+    if (gFGCustomUserAgent.length > 0) {
+        ((void (*)(id, SEL, id))objc_msgSend)(webView, @selector(setCustomUserAgent:),
+                                              gFGCustomUserAgent);
+    }
 
     _backgroundWebView = webView;
     _lastBackgroundFetchTime = [NSDate date].timeIntervalSince1970;
@@ -375,7 +416,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSURL *url = [NSURL URLWithString:urlString];
     ((void (*)(id, SEL, id))objc_msgSend)(webView, @selector(loadRequest:),
                                           [NSURLRequest requestWithURL:url]);
-    NSLog(@"[FakeGPS] 后台加载地址页: %@", urlString);
+    NSLog(@"[FakeGPS] bg load address page: %@", urlString);
 
     // 重放 App 用 evaluateJavaScript 注入的用户信息
     NSString *injectJS = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
@@ -387,7 +428,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
                                                       @selector(evaluateJavaScript:completionHandler:),
                                                       injectJS, nil);
             gFGInternalJS = NO;
-            NSLog(@"[FakeGPS] 重放注入脚本(%lu 字节)", (unsigned long)injectJS.length);
+            NSLog(@"[FakeGPS] replay inject JS after 2s (%lu bytes)", (unsigned long)injectJS.length);
         }
     });
 
@@ -405,7 +446,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     }
     [(UIView *)_backgroundWebView removeFromSuperview];
     _backgroundWebView = nil;
-    NSLog(@"[FakeGPS] 后台页面已回收");
+    NSLog(@"[FakeGPS] bg page recycled");
 }
 
 #pragma mark 钩子安装
@@ -429,10 +470,18 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     if (ucc != Nil) {
         MSHookMessageEx(ucc, @selector(addUserScript:),
                         (IMP)hooked_addUserScript, (IMP *)&orig_addUserScript);
+        MSHookMessageEx(ucc, @selector(addScriptMessageHandler:name:),
+                        (IMP)hooked_addMessageHandler, (IMP *)&orig_addMessageHandler);
+    }
+
+    Class wv = NSClassFromString(@"WKWebView");
+    if (wv != Nil) {
+        MSHookMessageEx(wv, @selector(setCustomUserAgent:),
+                        (IMP)hooked_setCustomUserAgent, (IMP *)&orig_setCustomUserAgent);
     }
 
     gFGWebHooked = YES;
-    NSLog(@"[FakeGPS] WebKit 钩子已安装");
+    NSLog(@"[FakeGPS] WebKit hooks installed");
 }
 
 @end
@@ -456,7 +505,7 @@ static void hooked_loadRequest(id self, SEL _cmd, NSURLRequest *request)
     if (![url isEqualToString:last]) {
         [[NSUserDefaults standardUserDefaults] setObject:url forKey:kFGLastH5URLKey];
         [[NSUserDefaults standardUserDefaults] synchronize];
-        NSLog(@"[FakeGPS] 记录地址页 URL: %@", url);
+        NSLog(@"[FakeGPS] captured address URL: %@", url);
     }
 }
 
@@ -471,7 +520,7 @@ static void hooked_evaluateJS(id self, SEL _cmd, NSString *script, id completion
         if (![script isEqualToString:last]) {
             [[NSUserDefaults standardUserDefaults] setObject:script forKey:kFGLastInjectJSKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
-            NSLog(@"[FakeGPS] 记录注入脚本(%lu 字节)", (unsigned long)script.length);
+            NSLog(@"[FakeGPS] captured inject JS (%lu bytes)", (unsigned long)script.length);
         }
     }
 
@@ -491,12 +540,37 @@ static void hooked_addUserScript(id self, SEL _cmd, id userScript)
             if (![source isEqualToString:last]) {
                 [[NSUserDefaults standardUserDefaults] setObject:source forKey:kFGLastUserScriptKey];
                 [[NSUserDefaults standardUserDefaults] synchronize];
-                NSLog(@"[FakeGPS] 记录 WKUserScript(%lu 字节)", (unsigned long)source.length);
+                NSLog(@"[FakeGPS] captured WKUserScript (%lu bytes)", (unsigned long)source.length);
             }
         }
     }
 
     orig_addUserScript(self, _cmd, userScript);
+}
+
+static void hooked_addMessageHandler(id self, SEL _cmd, id handler, NSString *name)
+{
+    if (name.length > 0 && handler != nil && ![name isEqualToString:@"fakegps"]) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            gFGMessageHandlers = [NSMutableDictionary dictionary];
+        });
+        if (gFGMessageHandlers[name] == nil) {
+            gFGMessageHandlers[name] = handler;
+            NSLog(@"[FakeGPS] captured message handler: %@", name);
+        }
+    }
+    orig_addMessageHandler(self, _cmd, handler, name);
+}
+
+static void hooked_setCustomUserAgent(id self, SEL _cmd, NSString *userAgent)
+{
+    if (userAgent.length > 0 && userAgent.length < 2000 &&
+        ![userAgent isEqualToString:gFGCustomUserAgent]) {
+        gFGCustomUserAgent = [userAgent copy];
+        NSLog(@"[FakeGPS] captured UA: %@", userAgent);
+    }
+    orig_setCustomUserAgent(self, _cmd, userAgent);
 }
 
 #pragma mark - 安装
