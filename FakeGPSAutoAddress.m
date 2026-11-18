@@ -39,10 +39,21 @@ static NSString *const kFGLastUserScriptKey = @"FGLastUserScript";
 static NSString *const kFGDefaultAddressURL =
     @"https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y";
 
-// 取页面纯文本（DOM 里就是「门店营业地址 / 仓库地址 / 经纬度」这些行）
+// 取页面纯文本 + 所有输入框的值。
+// 关键：该页的省市区/详细地址/经纬度都在 <input> 里，innerText 不含 value，
+// 实测后台页面 innerText 只有 66 个字符（提示语 + 店铺名 + 两个区块标题）。
 static NSString *const kFGPageTextJavaScript =
-    @"(function(){try{var b=document.body?document.body.innerText:'';"
-     "return b.substring(0,20000);}catch(e){return '';}})()";
+    @"(function(){try{"
+     "var t=document.body?document.body.innerText:'';"
+     "var e=document.querySelectorAll('input,textarea');"
+     "var s='\\n##INPUTS##\\n';"
+     "for(var i=0;i<e.length;i++){"
+     "var p=e[i].placeholder||'';"
+     "var v=e[i].value||'';"
+     "s+='['+i+'] '+p+' = '+v+'\\n';"
+     "}"
+     "return (t+s).substring(0,30000);"
+     "}catch(x){return '';}})()";
 
 static const NSTimeInterval kFGScanInterval        = 3.0;    // 轮询 DOM 间隔
 static const NSTimeInterval kFGBackgroundThrottle  = 60.0;   // 两次后台拉取最小间隔
@@ -108,19 +119,58 @@ static BOOL FGParseCoordinate(NSString *text, double *latitude, double *longitud
     return YES;
 }
 
-// 定位「仓库地址」这一段，再从其后的文本里取第一对经纬度
+// 取文本里最后一对合法经纬度（用于输入框顺序回落：门店在前、仓库在后）
+static BOOL FGLastCoordinateInText(NSString *text, double *latitude, double *longitude)
+{
+    static NSRegularExpression *regex;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        regex = [NSRegularExpression regularExpressionWithPattern:
+                 @"(-?\\d{1,3}(?:\\.\\d+)?)\\s*[,，]\\s*(-?\\d{1,3}(?:\\.\\d+)?)"
+                                                        options:0
+                                                          error:nil];
+    });
+
+    NSArray<NSTextCheckingResult *> *matches =
+        [regex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    for (NSTextCheckingResult *match in matches.reverseObjectEnumerator) {
+        double lat = [[text substringWithRange:[match rangeAtIndex:1]] doubleValue];
+        double lng = [[text substringWithRange:[match rangeAtIndex:2]] doubleValue];
+        if (lat >= -90.0 && lat <= 90.0 && lng >= -180.0 && lng <= 180.0) {
+            *latitude = lat;
+            *longitude = lng;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// 定位「仓库地址」这一段，再从其后的文本里取第一对经纬度；
+// 若文本段没有（值在输入框里），则在输入框区段里取最后一对经纬度
 static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double *longitude)
 {
     NSRange anchor = [text rangeOfString:@"仓库地址"];
-    if (anchor.location == NSNotFound) {
+    if (anchor.location != NSNotFound) {
+        NSUInteger start = anchor.location + anchor.length;
+        NSUInteger tailLength = MIN((NSUInteger)1200, text.length - start);
+        NSString *tail = [text substringWithRange:NSMakeRange(start, tailLength)];
+
+        NSRange inputs = [tail rangeOfString:@"##INPUTS##"];
+        if (inputs.location != NSNotFound) {
+            tail = [tail substringToIndex:inputs.location];
+        }
+        if (FGParseCoordinate(tail, latitude, longitude)) {
+            return YES;
+        }
+    }
+
+    NSRange inputs = [text rangeOfString:@"##INPUTS##"];
+    if (inputs.location == NSNotFound) {
         return NO;
     }
 
-    NSUInteger start = anchor.location + anchor.length;
-    NSUInteger tailLength = MIN((NSUInteger)1200, text.length - start);
-    NSString *tail = [text substringWithRange:NSMakeRange(start, tailLength)];
-
-    return FGParseCoordinate(tail, latitude, longitude);
+    NSString *inputSection = [text substringFromIndex:inputs.location];
+    return FGLastCoordinateInText(inputSection, latitude, longitude);
 }
 
 #pragma mark - 控制器
