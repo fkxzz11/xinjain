@@ -56,7 +56,7 @@ static NSString *const kFGPageTextJavaScript =
      "}catch(x){return '';}})()";
 
 static const NSTimeInterval kFGScanInterval        = 3.0;    // 轮询 DOM 间隔
-static const NSTimeInterval kFGBackgroundThrottle  = 60.0;   // 两次后台拉取最小间隔
+static const NSTimeInterval kFGBackgroundThrottle  = 15.0;   // 两次后台拉取最小间隔
 static const NSTimeInterval kFGSuccessCooldown     = 600.0;  // 成功后冷却
 static const NSTimeInterval kFGBackgroundLifetime  = 25.0;   // 后台 WebView 存活时长
 
@@ -184,6 +184,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
 - (void)handlePageText:(NSString *)text source:(NSString *)source;
 - (void)installWebKitHooksIfNeeded;
 - (void)maybeStartBackgroundFetch;
+- (void)requestImmediateBackgroundFetch;
 - (void)teardownBackgroundWebView;
 - (void)overrideDeviceLocationWithLatitude:(double)latitude longitude:(double)longitude;
 @end
@@ -194,6 +195,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSTimeInterval _lastBackgroundFetchTime;
     NSTimeInterval _lastCoordinateTime;
     NSTimeInterval _lastDiagLogTime;
+    int _bgFailCount;
     NSString *_lastCoordinateKey;
 }
 
@@ -290,6 +292,10 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
             [stack addObjectsFromArray:view.subviews];
         }
     }
+
+    // 每 3 秒给后台拉取一次机会（内部 15 秒节流）：
+    // App 冷启动时可能还在登录页，登录完成后靠这里自动补拉
+    [self maybeStartBackgroundFetch];
 }
 
 - (void)readTextFromWebView:(UIView *)webView
@@ -381,10 +387,10 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
         ([NSDate date].timeIntervalSince1970 - _lastCoordinateTime) < kFGSuccessCooldown) {
         return;
     }
-    if (([NSDate date].timeIntervalSince1970 - _lastBackgroundFetchTime) < kFGBackgroundThrottle) {
+    NSTimeInterval throttle = MIN(kFGBackgroundThrottle + 15.0 * (double)_bgFailCount, 120.0);
+    if (([NSDate date].timeIntervalSince1970 - _lastBackgroundFetchTime) < throttle) {
         return;
     }
-
     NSString *urlString = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5URLKey];
     if (!FGIsAddressPageURL(urlString)) {
         urlString = kFGDefaultAddressURL;
@@ -489,6 +495,16 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     });
 }
 
+- (void)requestImmediateBackgroundFetch
+{
+    _lastBackgroundFetchTime = 0;   // 绕过节流：登录后拿到新 token 应立刻重试
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf maybeStartBackgroundFetch];
+    });
+}
+
 - (void)teardownBackgroundWebView
 {
     if (_backgroundWebView == nil) {
@@ -496,7 +512,11 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     }
     [(UIView *)_backgroundWebView removeFromSuperview];
     _backgroundWebView = nil;
-    NSLog(@"[FakeGPS] bg page recycled");
+
+    BOOL gotRecently = (_lastCoordinateTime > 0) &&
+                       ([NSDate date].timeIntervalSince1970 - _lastCoordinateTime < 30.0);
+    _bgFailCount = gotRecently ? 0 : (_bgFailCount + 1);
+    NSLog(@"[FakeGPS] bg page recycled (consecutive fails=%d)", _bgFailCount);
 }
 
 #pragma mark 钩子安装
@@ -571,6 +591,9 @@ static void hooked_evaluateJS(id self, SEL _cmd, NSString *script, id completion
             [[NSUserDefaults standardUserDefaults] setObject:script forKey:kFGLastInjectJSKey];
             [[NSUserDefaults standardUserDefaults] synchronize];
             NSLog(@"[FakeGPS] captured inject JS (%lu bytes)", (unsigned long)script.length);
+
+            // 新 token 到手 → 立刻重试后台拉取（绕过节流）
+            [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
         }
     }
 
