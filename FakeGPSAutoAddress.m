@@ -418,28 +418,59 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     // 先看接口（即使文本已解析成功也打印一次，便于确认真实 API 与请求头）
     if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
         NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        if (now - _lastNetLogTime > 30.0) {
+        if (now - _lastNetLogTime > 15.0) {
             _lastNetLogTime = now;
             NSMutableString *brief = [NSMutableString string];
+            NSInteger apiCount = 0;
+
             for (NSDictionary *item in nets) {
                 if (![item isKindOfClass:[NSDictionary class]]) {
                     continue;
                 }
                 NSString *u = item[@"u"];
+                if (![u isKindOfClass:[NSString class]] || u.length == 0) {
+                    continue;
+                }
+
+                // 跳过静态资源，只保留接口
+                NSString *lower = u.lowercaseString;
+                if ([lower hasSuffix:@".js"] || [lower hasSuffix:@".css"] ||
+                    [lower hasSuffix:@".png"] || [lower hasSuffix:@".jpg"] ||
+                    [lower hasSuffix:@".svg"] || [lower hasSuffix:@".woff"] ||
+                    [lower hasSuffix:@".ttf"] || [lower containsString:@"/static/"]) {
+                    continue;
+                }
+
                 NSString *b = item[@"b"];
                 NSDictionary *h = item[@"h"];
+                NSNumber *s = item[@"s"];
                 NSString *hkeys = @"";
                 if ([h isKindOfClass:[NSDictionary class]] && h.count > 0) {
                     hkeys = [[h allKeys] componentsJoinedByString:@","];
                 }
-                if ([u isKindOfClass:[NSString class]]) {
-                    [brief appendFormat:@"%@(b=%lu,h=%@) ",
-                     u,
-                     (unsigned long)([b isKindOfClass:[NSString class]] ? b.length : 0),
-                     hkeys];
+
+                // URL 只保留最后两段，控制长度
+                NSArray *parts = [u componentsSeparatedByString:@"/"];
+                NSString *tail = u;
+                if (parts.count >= 2) {
+                    tail = [NSString stringWithFormat:@"…/%@/%@", parts[parts.count - 2], parts.lastObject];
+                }
+
+                [brief appendFormat:@"%@(s=%@,b=%lu,h=%@) ",
+                 tail,
+                 [s isKindOfClass:[NSNumber class]] ? s : @"?",
+                 (unsigned long)([b isKindOfClass:[NSString class]] ? b.length : 0),
+                 hkeys];
+                apiCount++;
+
+                if (brief.length > 900) {
+                    break;
                 }
             }
-            NSLog(@"[FakeGPS] xhr count=%lu %@", (unsigned long)nets.count, brief);
+
+            if (apiCount > 0) {
+                NSLog(@"[FakeGPS] xhr api n=%ld %@", (long)apiCount, brief);
+            }
         }
     }
 
