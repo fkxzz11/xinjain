@@ -35,9 +35,16 @@ static NSString *const kFGLastH5URLKey      = @"FGLastH5URL";
 static NSString *const kFGLastInjectJSKey   = @"FGLastInjectJS";
 static NSString *const kFGLastUserScriptKey = @"FGLastUserScript";
 static NSString *const kFGLastInjectTimeKey = @"FGLastInjectTime";
+static NSString *const kFGLastTokenKey      = @"FGLastToken";
+static NSString *const kFGLastTokenTimeKey  = @"FGLastTokenTime";
 
 // 进程启动时间：用于判断 token 是不是本次会话（登录后）注入的
 static NSTimeInterval gFGLaunchTime = 0;
+
+// 从 RN 接口请求头里抓到的鉴权 token（登录后即出现，不依赖打开 H5）
+static NSString *gFGToken = nil;
+static void (*orig_setValue)(id, SEL, NSString *, NSString *);
+static void hooked_setValue(id self, SEL _cmd, NSString *value, NSString *field);
 
 // 实测日志：https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y
 static NSString *const kFGDefaultAddressURL =
@@ -86,6 +93,30 @@ static void hooked_setCustomUserAgent(id self, SEL _cmd, NSString *userAgent);
 
 // 只有《门店地址》页才算：App 里所有 H5 都走 /dms2storeh5 前缀，
 // 必须靠 routerPath 区分（扫码页 kbrStoreReceiveScanOrInput 会覆盖记录）
+// 把缓存的注入脚本里的旧 token 换成本次会话抓到的新 token
+static NSString *FGPatchedInjectJS(NSString *js, NSString *token)
+{
+    if (js.length == 0 || token.length == 0) {
+        return js;
+    }
+
+    static NSRegularExpression *regex;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        regex = [NSRegularExpression regularExpressionWithPattern:
+                 @"((?:token|Token|TOKEN|authorization|Authorization|ticket|Ticket|jsessionid|JSESSIONID)"
+                 @"\\s*[:=]\\s*[\"'])[^\"']+([\"'])"
+                                                        options:0
+                                                          error:nil];
+    });
+
+    NSString *replacement = [NSString stringWithFormat:@"$1%@$2", token];
+    return [regex stringByReplacingMatchesInString:js
+                                           options:0
+                                             range:NSMakeRange(0, js.length)
+                                      withTemplate:replacement];
+}
+
 static BOOL FGIsAddressPageURL(NSString *url)
 {
     if (url.length == 0) {
@@ -393,11 +424,14 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
         return;
     }
 
-    // 只允许用「本次会话（登录之后）」注入的 token；登录界面阶段一律不动作
-    NSTimeInterval injectTime =
-        [[NSUserDefaults standardUserDefaults] doubleForKey:kFGLastInjectTimeKey];
-    if (injectTime <= 0 || injectTime < gFGLaunchTime) {
-        return;
+    // 本次会话是否已具备条件：要么抓到新注入脚本，要么抓到接口 token
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSTimeInterval injectTime = [defaults doubleForKey:kFGLastInjectTimeKey];
+    NSTimeInterval tokenTime  = [defaults doubleForKey:kFGLastTokenTimeKey];
+    BOOL freshInject = (injectTime >= gFGLaunchTime && injectTime > 0);
+    BOOL freshToken  = (tokenTime >= gFGLaunchTime && tokenTime > 0);
+    if (!freshInject && !freshToken) {
+        return;   // 登录界面阶段：不动作
     }
     if (_lastCoordinateTime > 0 &&
         ([NSDate date].timeIntervalSince1970 - _lastCoordinateTime) < kFGSuccessCooldown) {
@@ -443,7 +477,12 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     }
 
     // 重放 App 用 evaluateJavaScript 注入的用户信息（改为 documentStart，避免页面先跑起来）
-    NSString *injectJSAtStart = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
+    NSString *token = gFGToken;
+    if (token.length == 0) {
+        token = [defaults stringForKey:kFGLastTokenKey];
+    }
+    NSString *injectJSAtStart =
+        FGPatchedInjectJS([defaults stringForKey:kFGLastInjectJSKey], token);
     if (injectJSAtStart.length > 0 && usClass != Nil) {
         id script = ((id (*)(id, SEL, NSString *, NSInteger, BOOL))objc_msgSend)(
             ((id (*)(id, SEL))objc_msgSend)(usClass, @selector(alloc)),
@@ -491,7 +530,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSLog(@"[FakeGPS] bg load address page: %@", urlString);
 
     // 重放 App 用 evaluateJavaScript 注入的用户信息
-    NSString *injectJS = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
+    NSString *injectJS = injectJSAtStart;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (injectJS.length > 0 && self->_backgroundWebView != nil) {
@@ -678,9 +717,40 @@ static void hooked_viewDidAppear(id self, SEL _cmd, BOOL animated)
     [[FGAutoAddressController sharedController] handleAppearanceOf:self];
 }
 
+static void hooked_setValue(id self, SEL _cmd, NSString *value, NSString *field)
+{
+    if (value.length > 8 && value.length < 4096 && field.length > 0) {
+        NSString *lower = field.lowercaseString;
+        if ([lower containsString:@"token"] || [lower containsString:@"auth"] ||
+            [lower containsString:@"ticket"] || [lower containsString:@"session"]) {
+
+            if (![value isEqualToString:gFGToken]) {
+                gFGToken = [value copy];
+                NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+                [defaults setObject:value forKey:kFGLastTokenKey];
+                [defaults setDouble:[NSDate date].timeIntervalSince1970 forKey:kFGLastTokenTimeKey];
+                [defaults synchronize];
+
+                NSLog(@"[FakeGPS] captured auth header %@ (len=%lu)",
+                      field, (unsigned long)value.length);
+                [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
+            }
+        }
+    }
+
+    orig_setValue(self, _cmd, value, field);
+}
+
 void FGAutoAddressInstall(void)
 {
     gFGLaunchTime = [NSDate date].timeIntervalSince1970;
+
+    // 抓 RN 接口请求头里的鉴权 token（登录后立刻就有，不依赖打开 H5）
+    Class requestClass = NSClassFromString(@"NSMutableURLRequest");
+    if (requestClass != Nil) {
+        MSHookMessageEx(requestClass, @selector(setValue:forHTTPHeaderField:),
+                        (IMP)hooked_setValue, (IMP *)&orig_setValue);
+    }
 
     MSHookMessageEx(objc_getClass("UIViewController"), @selector(viewDidAppear:),
                     (IMP)hooked_viewDidAppear, (IMP *)&orig_viewDidAppear);
