@@ -55,13 +55,15 @@ static NSString *const kFGDefaultAddressURL =
 static NSString *const kFGPageTextJavaScript =
     @"(function(){try{"
      "if(!window.__fgNet){window.__fgNet=[];"
-     "var push=function(u,s,b){try{window.__fgNet.push({u:u,s:s,b:(b||'').substring(0,20000)});"
+     "var push=function(u,s,b,h){try{window.__fgNet.push({u:u,s:s,b:(b||'').substring(0,20000),h:h||{}});"
      "if(window.__fgNet.length>30){window.__fgNet.shift();}}catch(e){}};"
      "var X=window.XMLHttpRequest;"
-     "if(X&&X.prototype){var op=X.prototype.open,sd=X.prototype.send;"
-     "X.prototype.open=function(m,u){this.__fgUrl=u;return op.apply(this,arguments);};"
+     "if(X&&X.prototype){var op=X.prototype.open,sd=X.prototype.send,sh=X.prototype.setRequestHeader;"
+     "X.prototype.open=function(m,u){this.__fgUrl=u;this.__fgH={};return op.apply(this,arguments);};"
+     "X.prototype.setRequestHeader=function(k,v){try{this.__fgH=this.__fgH||{};this.__fgH[k]=v;}catch(e){}"
+     "return sh.apply(this,arguments);};"
      "X.prototype.send=function(){var self=this;"
-     "this.addEventListener('load',function(){push(self.__fgUrl,self.status,self.responseText);});"
+     "this.addEventListener('load',function(){push(self.__fgUrl,self.status,self.responseText,self.__fgH);});"
      "return sd.apply(this,arguments);};}"
      "if(window.fetch){var f=window.fetch;window.fetch=function(){"
      "var u=(arguments[0]&&arguments[0].url)||arguments[0];"
@@ -387,6 +389,36 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     }
 
     NSString *text = ((NSDictionary *)obj)[@"t"];
+    NSArray *nets = ((NSDictionary *)obj)[@"n"];
+
+    // 先看接口（即使文本已解析成功也打印一次，便于确认真实 API 与请求头）
+    if ([nets isKindOfClass:[NSArray class]] && nets.count > 0) {
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        if (now - _lastNetLogTime > 30.0) {
+            _lastNetLogTime = now;
+            NSMutableString *brief = [NSMutableString string];
+            for (NSDictionary *item in nets) {
+                if (![item isKindOfClass:[NSDictionary class]]) {
+                    continue;
+                }
+                NSString *u = item[@"u"];
+                NSString *b = item[@"b"];
+                NSDictionary *h = item[@"h"];
+                NSString *hkeys = @"";
+                if ([h isKindOfClass:[NSDictionary class]] && h.count > 0) {
+                    hkeys = [[h allKeys] componentsJoinedByString:@","];
+                }
+                if ([u isKindOfClass:[NSString class]]) {
+                    [brief appendFormat:@"%@(b=%lu,h=%@) ",
+                     u,
+                     (unsigned long)([b isKindOfClass:[NSString class]] ? b.length : 0),
+                     hkeys];
+                }
+            }
+            NSLog(@"[FakeGPS] xhr count=%lu %@", (unsigned long)nets.count, brief);
+        }
+    }
+
     if ([text isKindOfClass:[NSString class]] && text.length > 0) {
         [self handlePageText:text source:@"WKWebView"];
     }
@@ -395,27 +427,8 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
         return;
     }
 
-    NSArray *nets = ((NSDictionary *)obj)[@"n"];
     if (![nets isKindOfClass:[NSArray class]] || nets.count == 0) {
         return;
-    }
-
-    // 首次/低频打印一次接口列表，便于确认真实 API
-    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    if (now - _lastNetLogTime > 30.0) {
-        _lastNetLogTime = now;
-        NSMutableString *brief = [NSMutableString string];
-        for (NSDictionary *item in nets) {
-            if (![item isKindOfClass:[NSDictionary class]]) {
-                continue;
-            }
-            NSString *u = item[@"u"];
-            NSString *b = item[@"b"];
-            if ([u isKindOfClass:[NSString class]]) {
-                [brief appendFormat:@"%@(%lu) ", u, (unsigned long)([b isKindOfClass:[NSString class]] ? b.length : 0)];
-            }
-        }
-        NSLog(@"[FakeGPS] xhr count=%lu urls=%@", (unsigned long)nets.count, brief);
     }
 
     for (NSDictionary *item in nets) {
