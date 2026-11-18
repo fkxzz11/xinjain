@@ -46,12 +46,36 @@ static NSString *gFGToken = nil;
 static void (*orig_setValue)(id, SEL, NSString *, NSString *);
 static void hooked_setValue(id self, SEL _cmd, NSString *value, NSString *field);
 
+static void (*orig_initWithConfig)(id, SEL, CGRect, id);
+static void hooked_initWithConfig(id self, SEL _cmd, CGRect frame, id configuration);
+
 // 实测日志：https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y
 static NSString *const kFGDefaultAddressURL =
     @"https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y";
 
-// 探针：安装 XHR/fetch 嗅探器（幂等），并一次性返回
-//   { "t": 页面文本+输入框, "n": [ {u:url, s:status, b:body} ... ] }
+// 只在 documentStart 安装的嗅探器（由 initWithFrame:configuration: 钩子注入，
+// 保证页面发出的第一个 XHR/fetch 就被劫持，不会因为探针注入太晚而漏掉）
+static NSString *const kFGSnifferJavaScript =
+    @"(function(){try{"
+     "if(window.__fgNet){return 'ok';}"
+     "window.__fgNet=[];"
+     "var push=function(u,s,b,h){try{window.__fgNet.push({u:u,s:s,b:(b||'').substring(0,20000),h:h||{}});"
+     "if(window.__fgNet.length>30){window.__fgNet.shift();}}catch(e){}};"
+     "var X=window.XMLHttpRequest;"
+     "if(X&&X.prototype){var op=X.prototype.open,sd=X.prototype.send,sh=X.prototype.setRequestHeader;"
+     "X.prototype.open=function(m,u){this.__fgUrl=u;this.__fgH={};return op.apply(this,arguments);};"
+     "X.prototype.setRequestHeader=function(k,v){try{this.__fgH=this.__fgH||{};this.__fgH[k]=v;}catch(e){}"
+     "return sh.apply(this,arguments);};"
+     "X.prototype.send=function(){var self=this;"
+     "this.addEventListener('load',function(){push(self.__fgUrl,self.status,self.responseText,self.__fgH);});"
+     "return sd.apply(this,arguments);};}"
+     "if(window.fetch){var f=window.fetch;window.fetch=function(){"
+     "var u=(arguments[0]&&arguments[0].url)||arguments[0];"
+     "return f.apply(this,arguments).then(function(r){var c=r.clone();"
+     "c.text().then(function(t){push(u,r.status,t,{});});return r;});};}"
+     "return 'ok';}catch(e){return '';}})()";
+
+// 探针：补装嗅探器（幂等）并一次性返回 { t: 页面文本, n: [ {u,s,b,h} ] }
 static NSString *const kFGPageTextJavaScript =
     @"(function(){try{"
      "if(!window.__fgNet){window.__fgNet=[];"
@@ -693,6 +717,8 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     if (wv != Nil) {
         MSHookMessageEx(wv, @selector(setCustomUserAgent:),
                         (IMP)hooked_setCustomUserAgent, (IMP *)&orig_setCustomUserAgent);
+        MSHookMessageEx(wv, @selector(initWithFrame:configuration:),
+                        (IMP)hooked_initWithConfig, (IMP *)&orig_initWithConfig);
     }
 
     gFGWebHooked = YES;
@@ -849,6 +875,27 @@ static void hooked_setCustomUserAgent(id self, SEL _cmd, NSString *userAgent)
         NSLog(@"[FakeGPS] captured UA: %@", userAgent);
     }
     orig_setCustomUserAgent(self, _cmd, userAgent);
+}
+
+// WebView 创建时就把嗅探器塞进 documentStart，避免漏掉页面首个请求
+static void hooked_initWithConfig(id self, SEL _cmd, CGRect frame, id configuration)
+{
+    if (configuration != nil) {
+        Class usClass = NSClassFromString(@"WKUserScript");
+        if (usClass != Nil) {
+            id ucc = ((id (*)(id, SEL))objc_msgSend)(configuration,
+                                                     @selector(userContentController));
+            if (ucc != nil) {
+                id script = ((id (*)(id, SEL, NSString *, NSInteger, BOOL))objc_msgSend)(
+                    ((id (*)(id, SEL))objc_msgSend)(usClass, @selector(alloc)),
+                    @selector(initWithSource:injectionTime:forMainFrameOnly:),
+                    kFGSnifferJavaScript, 0, YES);
+                ((void (*)(id, SEL, id))objc_msgSend)(ucc, @selector(addUserScript:), script);
+            }
+        }
+    }
+
+    orig_initWithConfig(self, _cmd, frame, configuration);
 }
 
 #pragma mark - 安装
