@@ -300,6 +300,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSString *_lastWebCoordinateKey;
     id _backgroundWebView;
     NSTimeInterval _lastBackgroundFetchTime;
+    NSTimeInterval _lastCoordinateTime;
 }
 
 + (instancetype)sharedController
@@ -330,6 +331,12 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [weakSelf processViewController:viewController];
+    });
+
+    // 每次页面切换都给后台拉取一个机会（登录完成 → 首页也会触发），内部有 60s 节流
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf maybeStartBackgroundFetch];
     });
 }
 
@@ -498,6 +505,10 @@ static NSString *const kFGLastH5URLKey      = @"FGLastH5URL";
 static NSString *const kFGLastH5InjectJSKey = @"FGLastH5InjectJS";
 static NSString *const kFGLastUserScriptKey = @"FGLastUserScript";
 
+// 门店地址页的固定路由（实测日志：/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y）
+static NSString *const kFGDefaultAddressURL =
+    @"https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y";
+
 static BOOL gFGInternalJS = NO;          // 我们自己发起的 evaluateJavaScript，不参与抓取
 static BOOL gFGWebHooked  = NO;
 
@@ -614,6 +625,7 @@ static void hooked_WKUserContentController_addUserScript(id self, SEL _cmd, id u
         return;   // 同一坐标不重复处理
     }
     _lastWebCoordinateKey = key;
+    _lastCoordinateTime = [NSDate date].timeIntervalSince1970;
 
     NSLog(@"[FakeGPS] %@ 捕获仓库坐标 (%f, %f)", source, latitude, longitude);
     [self overrideDeviceLocationWithLatitude:latitude longitude:longitude];
@@ -652,14 +664,21 @@ static void hooked_WKUserContentController_addUserScript(id self, SEL _cmd, id u
     if (![self isEnabled] || _backgroundWebView != nil) {
         return;
     }
-    if (([NSDate date].timeIntervalSince1970 - _lastBackgroundFetchTime) < 120.0) {
+
+    // 10 分钟内已成功拿到过坐标，不必反复拉
+    if (_lastCoordinateTime > 0 &&
+        ([NSDate date].timeIntervalSince1970 - _lastCoordinateTime) < 600.0) {
+        return;
+    }
+    // 两次尝试至少间隔 60 秒
+    if (([NSDate date].timeIntervalSince1970 - _lastBackgroundFetchTime) < 60.0) {
         return;
     }
 
     NSString *urlString = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5URLKey];
     if (urlString.length == 0) {
-        NSLog(@"[FakeGPS] 还没有 H5 URL 记录，需要先手动打开一次《门店地址》页");
-        return;
+        urlString = kFGDefaultAddressURL;   // 路由固定，内置兜底
+        NSLog(@"[FakeGPS] 尚无记录 URL，使用内置默认地址页 URL");
     }
 
     UIWindow *window = [UIApplication sharedApplication].keyWindow;
