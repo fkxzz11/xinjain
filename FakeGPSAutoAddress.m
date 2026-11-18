@@ -125,6 +125,9 @@ static NSString *FGPatchedInjectJS(NSString *js, NSString *token)
                                       withTemplate:replacement];
 }
 
+// 把 JS 里的 \uXXXX 转义还原成中文（数据桥回写的 JSON 常被转义）—— 前置声明
+static NSString *FGUnescapeUnicode(NSString *text);
+
 static BOOL FGIsAddressPageURL(NSString *url)
 {
     if (url.length == 0) {
