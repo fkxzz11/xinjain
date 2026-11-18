@@ -50,21 +50,29 @@ static void hooked_setValue(id self, SEL _cmd, NSString *value, NSString *field)
 static NSString *const kFGDefaultAddressURL =
     @"https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y";
 
-// 取页面纯文本 + 所有输入框的值。
-// 关键：该页的省市区/详细地址/经纬度都在 <input> 里，innerText 不含 value，
-// 实测后台页面 innerText 只有 66 个字符（提示语 + 店铺名 + 两个区块标题）。
+// 探针：安装 XHR/fetch 嗅探器（幂等），并一次性返回
+//   { "t": 页面文本+输入框, "n": [ {u:url, s:status, b:body} ... ] }
 static NSString *const kFGPageTextJavaScript =
     @"(function(){try{"
+     "if(!window.__fgNet){window.__fgNet=[];"
+     "var push=function(u,s,b){try{window.__fgNet.push({u:u,s:s,b:(b||'').substring(0,20000)});"
+     "if(window.__fgNet.length>30){window.__fgNet.shift();}}catch(e){}};"
+     "var X=window.XMLHttpRequest;"
+     "if(X&&X.prototype){var op=X.prototype.open,sd=X.prototype.send;"
+     "X.prototype.open=function(m,u){this.__fgUrl=u;return op.apply(this,arguments);};"
+     "X.prototype.send=function(){var self=this;"
+     "this.addEventListener('load',function(){push(self.__fgUrl,self.status,self.responseText);});"
+     "return sd.apply(this,arguments);};}"
+     "if(window.fetch){var f=window.fetch;window.fetch=function(){"
+     "var u=(arguments[0]&&arguments[0].url)||arguments[0];"
+     "return f.apply(this,arguments).then(function(r){var c=r.clone();"
+     "c.text().then(function(t){push(u,r.status,t);});return r;});};}}"
      "var t=document.body?document.body.innerText:'';"
      "var e=document.querySelectorAll('input,textarea');"
      "var s='\\n##INPUTS##\\n';"
-     "for(var i=0;i<e.length;i++){"
-     "var p=e[i].placeholder||'';"
-     "var v=e[i].value||'';"
-     "s+='['+i+'] '+p+' = '+v+'\\n';"
-     "}"
-     "return (t+s).substring(0,30000);"
-     "}catch(x){return '';}})()";
+     "for(var i=0;i<e.length;i++){s+='['+i+'] '+(e[i].placeholder||'')+' = '+(e[i].value||'')+'\\n';}"
+     "return JSON.stringify({t:(t+s).substring(0,30000),n:window.__fgNet||[]});"
+     "}catch(e){return '';}})()";
 
 static const NSTimeInterval kFGScanInterval        = 3.0;    // 轮询 DOM 间隔
 static const NSTimeInterval kFGBackgroundThrottle  = 15.0;   // 两次后台拉取最小间隔
@@ -216,6 +224,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
 - (void)startObservation;
 - (void)scanWebViews;
 - (void)readTextFromWebView:(UIView *)webView;
+- (void)handleProbeResult:(NSString *)json;
 - (void)handlePageText:(NSString *)text source:(NSString *)source;
 - (void)installWebKitHooksIfNeeded;
 - (void)maybeStartBackgroundFetch;
@@ -230,6 +239,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSTimeInterval _lastBackgroundFetchTime;
     NSTimeInterval _lastCoordinateTime;
     NSTimeInterval _lastDiagLogTime;
+    NSTimeInterval _lastNetLogTime;
     int _bgFailCount;
     BOOL _done;   // 本次会话已成功拿到坐标 → 不再做任何拉取
     NSString *_lastCoordinateKey;
@@ -342,7 +352,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     if (wk != Nil && [webView isKindOfClass:wk]) {
         id handler = ^(id result, NSError *error) {
             if (error == nil && [result isKindOfClass:[NSString class]]) {
-                [weakSelf handlePageText:(NSString *)result source:@"WKWebView"];
+                [weakSelf handleProbeResult:(NSString *)result];
             }
         };
         gFGInternalJS = YES;
@@ -358,7 +368,71 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSString *text = ((NSString * (*)(id, SEL, id))objc_msgSend)(
         webView, @selector(stringByEvaluatingJavaScriptFromString:), kFGPageTextJavaScript);
     if (text.length > 0) {
-        [self handlePageText:text source:@"UIWebView"];
+        [self handleProbeResult:text];
+    }
+}
+
+// 解析探针返回的 {t:页面文本, n:[{u,s,b}]}
+- (void)handleProbeResult:(NSString *)json
+{
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    id obj = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+
+    if (![obj isKindOfClass:[NSDictionary class]]) {
+        [self handlePageText:json source:@"WKWebView"];
+        return;
+    }
+
+    NSString *text = ((NSDictionary *)obj)[@"t"];
+    if ([text isKindOfClass:[NSString class]] && text.length > 0) {
+        [self handlePageText:text source:@"WKWebView"];
+    }
+
+    if (_done) {
+        return;
+    }
+
+    NSArray *nets = ((NSDictionary *)obj)[@"n"];
+    if (![nets isKindOfClass:[NSArray class]] || nets.count == 0) {
+        return;
+    }
+
+    // 首次/低频打印一次接口列表，便于确认真实 API
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - _lastNetLogTime > 30.0) {
+        _lastNetLogTime = now;
+        NSMutableString *brief = [NSMutableString string];
+        for (NSDictionary *item in nets) {
+            if (![item isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            NSString *u = item[@"u"];
+            NSString *b = item[@"b"];
+            if ([u isKindOfClass:[NSString class]]) {
+                [brief appendFormat:@"%@(%lu) ", u, (unsigned long)([b isKindOfClass:[NSString class]] ? b.length : 0)];
+            }
+        }
+        NSLog(@"[FakeGPS] xhr count=%lu urls=%@", (unsigned long)nets.count, brief);
+    }
+
+    for (NSDictionary *item in nets) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSString *body = item[@"b"];
+        NSString *url = item[@"u"];
+        if (![body isKindOfClass:[NSString class]] || body.length == 0) {
+            continue;
+        }
+
+        double lat = 0, lng = 0;
+        NSString *decoded = FGUnescapeUnicode(body);
+        if (FGParseWarehouseCoordinate(decoded, &lat, &lng)) {
+            NSLog(@"[FakeGPS] coords found in xhr: %@", url);
+            NSString *synthetic = [NSString stringWithFormat:@"仓库地址 %f,%f", lat, lng];
+            [self handlePageText:synthetic source:@"xhr"];
+            break;
+        }
     }
 }
 
