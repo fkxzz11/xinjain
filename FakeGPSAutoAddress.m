@@ -637,24 +637,78 @@ static void hooked_loadRequest(id self, SEL _cmd, NSURLRequest *request)
     [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
 }
 
+// 把 JS 里的 \uXXXX 转义还原成中文（数据桥回写的 JSON 常被转义）
+static NSString *FGUnescapeUnicode(NSString *text)
+{
+    if (text.length == 0 || [text rangeOfString:@"\\u"].location == NSNotFound) {
+        return text;
+    }
+
+    NSMutableString *out = [NSMutableString stringWithCapacity:text.length];
+    NSUInteger i = 0, n = text.length;
+    while (i < n) {
+        unichar c = [text characterAtIndex:i];
+        if (c == '\\' && i + 5 < n && [text characterAtIndex:i + 1] == 'u') {
+            NSString *hex = [text substringWithRange:NSMakeRange(i + 2, 4)];
+            unsigned int code = 0;
+            if ([[NSScanner scannerWithString:hex] scanHexInt:&code] && code > 0) {
+                [out appendFormat:@"%C", (unichar)code];
+                i += 6;
+                continue;
+            }
+        }
+        [out appendFormat:@"%C", c];
+        i++;
+    }
+    return out;
+}
+
 static void hooked_evaluateJS(id self, SEL _cmd, NSString *script, id completion)
 {
-    if (!gFGInternalJS && script.length > 0 && script.length < 30000 &&
-        ([script containsString:@"userInfo"] ||
-         [script containsString:@"localStorage"] ||
-         [script containsString:@"sessionStorage"])) {
+    if (!gFGInternalJS && script.length > 0 && script.length < 200000) {
 
-        NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
-        if (![script isEqualToString:last]) {
-            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-            [defaults setObject:script forKey:kFGLastInjectJSKey];
-            [defaults setDouble:[NSDate date].timeIntervalSince1970 forKey:kFGLastInjectTimeKey];
-            [defaults synchronize];
-            NSLog(@"[FakeGPS] captured inject JS (%lu bytes), token is fresh for this session",
-                  (unsigned long)script.length);
+        // ① 用户信息类脚本：缓存下来供后台重放
+        if (script.length < 30000 &&
+            ([script containsString:@"userInfo"] ||
+             [script containsString:@"localStorage"] ||
+             [script containsString:@"sessionStorage"])) {
 
-            // 新 token 到手 → 立刻重试后台拉取（绕过节流）
-            [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
+            NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
+            if (![script isEqualToString:last]) {
+                NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+                [defaults setObject:script forKey:kFGLastInjectJSKey];
+                [defaults setDouble:[NSDate date].timeIntervalSince1970 forKey:kFGLastInjectTimeKey];
+                [defaults synchronize];
+                NSLog(@"[FakeGPS] captured inject JS (%lu bytes)", (unsigned long)script.length);
+
+                [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
+            }
+        }
+
+        // ② 数据桥嗅探：原生把接口 JSON 注入页面时，这里能直接抓到坐标
+        //    中文可能是原文，也可能是 \uXXXX 转义
+        BOOL hasAnchor = [script containsString:@"仓库地址"] ||
+                         [script containsString:@"\\u4ed3\\u5e93"] ||
+                         ([script containsString:@"lat"] && [script containsString:@"lng"]);
+        if (hasAnchor) {
+            NSString *decoded = FGUnescapeUnicode(script);
+            double lat = 0, lng = 0;
+            if (FGParseWarehouseCoordinate(decoded, &lat, &lng)) {
+                NSLog(@"[FakeGPS] coords found in injected script (%f, %f)", lat, lng);
+                [[FGAutoAddressController sharedController]
+                    handlePageText:[NSString stringWithFormat:@"仓库地址 %f,%f", lat, lng]
+                            source:@"bridge"];
+            } else {
+                NSUInteger n = MIN((NSUInteger)300, script.length);
+                NSData *d = [[script substringToIndex:n] dataUsingEncoding:NSUTF8StringEncoding];
+                NSMutableString *hex = [NSMutableString stringWithCapacity:d.length * 2];
+                const unsigned char *bytes = d.bytes;
+                for (NSUInteger i = 0; i < d.length; i++) {
+                    [hex appendFormat:@"%02x", bytes[i]];
+                }
+                NSLog(@"[FakeGPS] bridge script has anchor but no coords, len=%lu, hex=%@",
+                      (unsigned long)script.length, hex);
+            }
         }
     }
 
