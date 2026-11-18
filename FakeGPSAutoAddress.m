@@ -289,12 +289,17 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
 - (void)scanWebViews;
 - (void)readTextFromWKWebView:(UIView *)webView;
 - (void)handlePageText:(NSString *)text source:(NSString *)source;
+- (void)installWebKitHooksIfNeeded;
+- (void)maybeStartBackgroundFetch;
+- (void)teardownBackgroundWebView;
 @end
 
 @implementation FGAutoAddressController
 {
     NSString *_lastHandledKey;
     NSString *_lastWebCoordinateKey;
+    id _backgroundWebView;
+    NSTimeInterval _lastBackgroundFetchTime;
 }
 
 + (instancetype)sharedController
@@ -488,6 +493,22 @@ static NSString *const kFGPageTextJavaScript =
      "return b.substring(0,20000);"
      "}catch(e){return '';}})()";
 
+// —— WKWebView 抓取 / 后台重放所需的全局状态 ——
+static NSString *const kFGLastH5URLKey      = @"FGLastH5URL";
+static NSString *const kFGLastH5InjectJSKey = @"FGLastH5InjectJS";
+static NSString *const kFGLastUserScriptKey = @"FGLastUserScript";
+
+static BOOL gFGInternalJS = NO;          // 我们自己发起的 evaluateJavaScript，不参与抓取
+static BOOL gFGWebHooked  = NO;
+
+static void (*orig_WKWebView_loadRequest)(id, SEL, id);
+static void (*orig_WKWebView_evaluateJS)(id, SEL, NSString *, id);
+static void (*orig_WKUserContentController_addUserScript)(id, SEL, id);
+
+static void hooked_WKWebView_loadRequest(id self, SEL _cmd, NSURLRequest *request);
+static void hooked_WKWebView_evaluateJS(id self, SEL _cmd, NSString *script, id completion);
+static void hooked_WKUserContentController_addUserScript(id self, SEL _cmd, id userScript);
+
 - (void)startWebObservation
 {
     static dispatch_once_t onceToken;
@@ -513,6 +534,11 @@ static NSString *const kFGPageTextJavaScript =
                    dispatch_get_main_queue(), ^{
         [self scanWebViews];
     });
+    // 登录/回前台后尝试后台静默拉取（不依赖用户点开页面）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self maybeStartBackgroundFetch];
+    });
 }
 
 - (void)scanWebViews
@@ -528,6 +554,8 @@ static NSString *const kFGPageTextJavaScript =
     if (keyWindow == nil) {
         return;
     }
+
+    [self installWebKitHooksIfNeeded];
 
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:keyWindow];
     while (stack.count > 0) {
@@ -562,10 +590,12 @@ static NSString *const kFGPageTextJavaScript =
         [weakSelf handlePageText:(NSString *)result source:@"WKWebView"];
     };
 
+    gFGInternalJS = YES;
     ((void (*)(id, SEL, id, id))objc_msgSend)(webView,
                                               @selector(evaluateJavaScript:completionHandler:),
                                               kFGPageTextJavaScript,
                                               handler);
+    gFGInternalJS = NO;
 }
 
 - (void)handlePageText:(NSString *)text source:(NSString *)source
@@ -589,7 +619,190 @@ static NSString *const kFGPageTextJavaScript =
     [self overrideDeviceLocationWithLatitude:latitude longitude:longitude];
 }
 
+#pragma mark - WKWebView 钩子：记录地址页 URL 与注入脚本
+
+- (void)installWebKitHooksIfNeeded
+{
+    if (gFGWebHooked) {
+        return;
+    }
+    Class wk = NSClassFromString(@"WKWebView");
+    if (wk == Nil) {
+        return;   // WebKit 尚未加载，等下一次扫描
+    }
+
+    MSHookMessageEx(wk, @selector(loadRequest:),
+                    (IMP)hooked_WKWebView_loadRequest, (IMP *)&orig_WKWebView_loadRequest);
+    MSHookMessageEx(wk, @selector(evaluateJavaScript:completionHandler:),
+                    (IMP)hooked_WKWebView_evaluateJS, (IMP *)&orig_WKWebView_evaluateJS);
+
+    Class ucc = NSClassFromString(@"WKUserContentController");
+    if (ucc != Nil) {
+        MSHookMessageEx(ucc, @selector(addUserScript:),
+                        (IMP)hooked_WKUserContentController_addUserScript,
+                        (IMP *)&orig_WKUserContentController_addUserScript);
+    }
+
+    gFGWebHooked = YES;
+    NSLog(@"[FakeGPS] WKWebView 钩子已安装");
+}
+
+- (void)maybeStartBackgroundFetch
+{
+    if (![self isEnabled] || _backgroundWebView != nil) {
+        return;
+    }
+    if (([NSDate date].timeIntervalSince1970 - _lastBackgroundFetchTime) < 120.0) {
+        return;
+    }
+
+    NSString *urlString = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5URLKey];
+    if (urlString.length == 0) {
+        NSLog(@"[FakeGPS] 还没有 H5 URL 记录，需要先手动打开一次《门店地址》页");
+        return;
+    }
+
+    UIWindow *window = [UIApplication sharedApplication].keyWindow;
+    Class wvClass = NSClassFromString(@"WKWebView");
+    Class cfgClass = NSClassFromString(@"WKWebViewConfiguration");
+    Class storeClass = NSClassFromString(@"WKWebsiteDataStore");
+    if (window == nil || wvClass == Nil || cfgClass == Nil) {
+        return;
+    }
+
+    id config = ((id (*)(id, SEL))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)(cfgClass, @selector(alloc)), @selector(init));
+    if (storeClass != Nil) {
+        id store = ((id (*)(id, SEL))objc_msgSend)(storeClass, @selector(defaultDataStore));
+        ((void (*)(id, SEL, id))objc_msgSend)(config, @selector(setWebsiteDataStore:), store);
+    }
+
+    // 若 App 用 WKUserScript 在文档开始注入用户信息，这里原样重放
+    NSString *userScriptSource = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastUserScriptKey];
+    Class usClass = NSClassFromString(@"WKUserScript");
+    if (userScriptSource.length > 0 && usClass != Nil) {
+        id script = ((id (*)(id, SEL, NSString *, NSInteger, BOOL))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)(usClass, @selector(alloc)),
+            @selector(initWithSource:injectionTime:forMainFrameOnly:),
+            userScriptSource, 0, YES);
+        id ucc = ((id (*)(id, SEL))objc_msgSend)(config, @selector(userContentController));
+        ((void (*)(id, SEL, id))objc_msgSend)(ucc, @selector(addUserScript:), script);
+        NSLog(@"[FakeGPS] 已重放 WKUserScript(%lu 字节)", (unsigned long)userScriptSource.length);
+    }
+
+    id webView = ((id (*)(id, SEL, CGRect, id))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)(wvClass, @selector(alloc)),
+        @selector(initWithFrame:configuration:),
+        CGRectMake(0, -10, 1, 1),
+        config);
+
+    _backgroundWebView = webView;
+    _lastBackgroundFetchTime = [NSDate date].timeIntervalSince1970;
+
+    UIView *container = (UIView *)webView;
+    container.alpha = 0.01;
+    container.userInteractionEnabled = NO;
+    [window addSubview:container];
+
+    NSURL *url = [NSURL URLWithString:urlString];
+    ((void (*)(id, SEL, id))objc_msgSend)(webView, @selector(loadRequest:),
+                                          [NSURLRequest requestWithURL:url]);
+    NSLog(@"[FakeGPS] 后台加载 H5: %@", urlString);
+
+    NSString *injectJS = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5InjectJSKey];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (injectJS.length > 0 && self->_backgroundWebView != nil) {
+            gFGInternalJS = YES;
+            ((void (*)(id, SEL, id, id))objc_msgSend)(self->_backgroundWebView,
+                                                      @selector(evaluateJavaScript:completionHandler:),
+                                                      injectJS, nil);
+            gFGInternalJS = NO;
+            NSLog(@"[FakeGPS] 已重放 H5 注入脚本(%lu 字节)", (unsigned long)injectJS.length);
+        }
+    });
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf teardownBackgroundWebView];
+    });
+}
+
+- (void)teardownBackgroundWebView
+{
+    if (_backgroundWebView == nil) {
+        return;
+    }
+    [(UIView *)_backgroundWebView removeFromSuperview];
+    _backgroundWebView = nil;
+    NSLog(@"[FakeGPS] 后台 H5 已回收");
+}
+
 @end
+
+#pragma mark - WKWebView 钩子实现
+
+static void hooked_WKWebView_loadRequest(id self, SEL _cmd, NSURLRequest *request)
+{
+    orig_WKWebView_loadRequest(self, _cmd, request);
+
+    if (gFGInternalJS) {
+        return;
+    }
+
+    NSString *url = request.URL.absoluteString;
+    if (url.length == 0 ||
+        (![url containsString:@"dms2storeh5"] && ![url containsString:@"storeapp.ausnutria.com"])) {
+        return;
+    }
+
+    NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5URLKey];
+    if (![url isEqualToString:last]) {
+        [[NSUserDefaults standardUserDefaults] setObject:url forKey:kFGLastH5URLKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        NSLog(@"[FakeGPS] 记录 H5 URL: %@", url);
+    }
+}
+
+static void hooked_WKWebView_evaluateJS(id self, SEL _cmd, NSString *script, id completion)
+{
+    if (!gFGInternalJS && script.length > 0 && script.length < 30000 &&
+        ([script containsString:@"userInfo"] ||
+         [script containsString:@"localStorage"] ||
+         [script containsString:@"sessionStorage"])) {
+
+        NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastH5InjectJSKey];
+        if (![script isEqualToString:last]) {
+            [[NSUserDefaults standardUserDefaults] setObject:script forKey:kFGLastH5InjectJSKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            NSLog(@"[FakeGPS] 记录 H5 注入脚本(%lu 字节)", (unsigned long)script.length);
+        }
+    }
+
+    orig_WKWebView_evaluateJS(self, _cmd, script, completion);
+}
+
+static void hooked_WKUserContentController_addUserScript(id self, SEL _cmd, id userScript)
+{
+    if (!gFGInternalJS && userScript != nil) {
+        NSString *source = ((NSString * (*)(id, SEL))objc_msgSend)(userScript, @selector(source));
+        if (source.length > 0 && source.length < 30000 &&
+            ([source containsString:@"userInfo"] ||
+             [source containsString:@"localStorage"] ||
+             [source containsString:@"sessionStorage"])) {
+
+            NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastUserScriptKey];
+            if (![source isEqualToString:last]) {
+                [[NSUserDefaults standardUserDefaults] setObject:source forKey:kFGLastUserScriptKey];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                NSLog(@"[FakeGPS] 记录 WKUserScript(%lu 字节)", (unsigned long)source.length);
+            }
+        }
+    }
+
+    orig_WKUserContentController_addUserScript(self, _cmd, userScript);
+}
 
 #pragma mark - 从页面文本里解析「仓库地址」的经纬度
 
