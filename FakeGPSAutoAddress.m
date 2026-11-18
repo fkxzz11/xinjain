@@ -34,6 +34,10 @@ static NSString *const kAutoOverrideEnabled    = @"AutoAddressOverrideEnabled";
 static NSString *const kFGLastH5URLKey      = @"FGLastH5URL";
 static NSString *const kFGLastInjectJSKey   = @"FGLastInjectJS";
 static NSString *const kFGLastUserScriptKey = @"FGLastUserScript";
+static NSString *const kFGLastInjectTimeKey = @"FGLastInjectTime";
+
+// 进程启动时间：用于判断 token 是不是本次会话（登录后）注入的
+static NSTimeInterval gFGLaunchTime = 0;
 
 // 实测日志：https://storeapp.ausnutria.com/dms2storeh5/#/?routerPath=/storeAddressUpdate&isNative=Y
 static NSString *const kFGDefaultAddressURL =
@@ -196,6 +200,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     NSTimeInterval _lastCoordinateTime;
     NSTimeInterval _lastDiagLogTime;
     int _bgFailCount;
+    BOOL _done;   // 本次会话已成功拿到坐标 → 不再做任何拉取
     NSString *_lastCoordinateKey;
 }
 
@@ -359,6 +364,7 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
     }
     _lastCoordinateKey = key;
     _lastCoordinateTime = [NSDate date].timeIntervalSince1970;
+    _done = YES;   // 成功即停
 
     NSLog(@"[FakeGPS] coords captured by %@ (%f, %f)", source, latitude, longitude);
     [self overrideDeviceLocationWithLatitude:latitude longitude:longitude];
@@ -380,7 +386,17 @@ static BOOL FGParseWarehouseCoordinate(NSString *text, double *latitude, double 
 
 - (void)maybeStartBackgroundFetch
 {
+    if (_done) {
+        return;   // 本次会话已成功，停止一切拉取
+    }
     if (![self isEnabled] || _backgroundWebView != nil) {
+        return;
+    }
+
+    // 只允许用「本次会话（登录之后）」注入的 token；登录界面阶段一律不动作
+    NSTimeInterval injectTime =
+        [[NSUserDefaults standardUserDefaults] doubleForKey:kFGLastInjectTimeKey];
+    if (injectTime <= 0 || injectTime < gFGLaunchTime) {
         return;
     }
     if (_lastCoordinateTime > 0 &&
@@ -577,6 +593,9 @@ static void hooked_loadRequest(id self, SEL _cmd, NSURLRequest *request)
         [[NSUserDefaults standardUserDefaults] synchronize];
         NSLog(@"[FakeGPS] captured address URL: %@", url);
     }
+
+    // 用户已打开《门店地址》页 → 也给后台拉取一次机会（成功即停）
+    [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
 }
 
 static void hooked_evaluateJS(id self, SEL _cmd, NSString *script, id completion)
@@ -588,9 +607,12 @@ static void hooked_evaluateJS(id self, SEL _cmd, NSString *script, id completion
 
         NSString *last = [[NSUserDefaults standardUserDefaults] stringForKey:kFGLastInjectJSKey];
         if (![script isEqualToString:last]) {
-            [[NSUserDefaults standardUserDefaults] setObject:script forKey:kFGLastInjectJSKey];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-            NSLog(@"[FakeGPS] captured inject JS (%lu bytes)", (unsigned long)script.length);
+            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+            [defaults setObject:script forKey:kFGLastInjectJSKey];
+            [defaults setDouble:[NSDate date].timeIntervalSince1970 forKey:kFGLastInjectTimeKey];
+            [defaults synchronize];
+            NSLog(@"[FakeGPS] captured inject JS (%lu bytes), token is fresh for this session",
+                  (unsigned long)script.length);
 
             // 新 token 到手 → 立刻重试后台拉取（绕过节流）
             [[FGAutoAddressController sharedController] requestImmediateBackgroundFetch];
@@ -658,6 +680,8 @@ static void hooked_viewDidAppear(id self, SEL _cmd, BOOL animated)
 
 void FGAutoAddressInstall(void)
 {
+    gFGLaunchTime = [NSDate date].timeIntervalSince1970;
+
     MSHookMessageEx(objc_getClass("UIViewController"), @selector(viewDidAppear:),
                     (IMP)hooked_viewDidAppear, (IMP *)&orig_viewDidAppear);
 
